@@ -25,16 +25,14 @@ type GoBGP struct {
 	Addr     string
 	Timeout  time.Duration
 	AS       uint16
-	Handler  BGPHandler
 	client   api.GobgpApiClient
 	routerID string
 }
 
-func NewGoBGP(addr string, as uint16, h BGPHandler) *GoBGP {
+func NewGoBGP(addr string, as uint16) *GoBGP {
 	return &GoBGP{
-		Addr:    addr,
-		AS:      as,
-		Handler: h,
+		Addr: addr,
+		AS:   as,
 	}
 }
 
@@ -173,7 +171,7 @@ func (g *GoBGP) addPath(path *api.Path, vni uint32) error {
 	}
 }
 
-func (g *GoBGP) WatchRIB() error {
+func (g *GoBGP) WatchRIB(h BGPHandler) error {
 	table := &api.Table{
 		Type:   api.Resource_GLOBAL,
 		Family: uint32(bgp.RF_EVPN),
@@ -183,7 +181,7 @@ func (g *GoBGP) WatchRIB() error {
 		return err
 	}
 	for _, dst := range resp.Table.Destinations {
-		if err = g.handleRIBEntry(dst); err != nil {
+		if err = g.handleRIBEntry(h, dst); err != nil {
 			return err
 		}
 	}
@@ -197,13 +195,13 @@ func (g *GoBGP) WatchRIB() error {
 		if err != nil {
 			return err
 		}
-		if err = g.handleRIBEntry(dst); err != nil {
+		if err = g.handleRIBEntry(h, dst); err != nil {
 			return err
 		}
 	}
 }
 
-func (g *GoBGP) handleRIBEntry(dst *api.Destination) error {
+func (g *GoBGP) handleRIBEntry(h BGPHandler, dst *api.Destination) error {
 	path := findBestPath(dst)
 	afi, safi := bgp.RouteFamilyToAfiSafi(bgp.RouteFamily(path.Family))
 	nlri, err := bgp.NewPrefixFromRouteFamily(afi, safi)
@@ -222,22 +220,22 @@ func (g *GoBGP) handleRIBEntry(dst *api.Destination) error {
 	if err != nil {
 		return err
 	}
-	if nexthop == nil || nexthop.String() == localHop {
+	if nexthop == nil {
 		return nil
 	}
 
 	switch v := evpn.RouteTypeData.(type) {
 	case *bgp.EVPNMacIPAdvertisementRoute:
 		if !path.IsWithdraw {
-			g.Handler.AddMacIPRoute(v.ETag, v.MacAddress, v.IPAddress, nexthop)
+			h.AddMacIPRoute(v.ETag, v.MacAddress, v.IPAddress, nexthop)
 		} else {
-			g.Handler.DeleteMacIPRoute(v.ETag, v.MacAddress, v.IPAddress, nexthop)
+			h.DeleteMacIPRoute(v.ETag, v.MacAddress, v.IPAddress, nexthop)
 		}
 	case *bgp.EVPNMulticastEthernetTagRoute:
 		if !path.IsWithdraw {
-			g.Handler.AddMulticastRoute(v.ETag, v.IPAddress, nexthop)
+			h.AddMulticastRoute(v.ETag, v.IPAddress, nexthop)
 		} else {
-			g.Handler.DeleteMulticastRoute(v.ETag, v.IPAddress, nexthop)
+			h.DeleteMulticastRoute(v.ETag, v.IPAddress, nexthop)
 		}
 	}
 	return nil
@@ -312,4 +310,8 @@ func mustSerializeAll(s ...serializer) [][]byte {
 		panic(err)
 	}
 	return out
+}
+
+func isLocalHop(nexthop net.IP) bool {
+	return nexthop.String() == localHop
 }
