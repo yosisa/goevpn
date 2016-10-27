@@ -14,6 +14,11 @@ import (
 
 const localHop = "0.0.0.0"
 
+var evpnTable = &api.Table{
+	Type:   api.Resource_GLOBAL,
+	Family: uint32(bgp.RF_EVPN),
+}
+
 type BGPHandler interface {
 	AddMacIPRoute(uint32, net.HardwareAddr, net.IP, net.IP)
 	DeleteMacIPRoute(uint32, net.HardwareAddr, net.IP, net.IP)
@@ -171,12 +176,8 @@ func (g *GoBGP) addPath(path *api.Path, vni uint32) error {
 	}
 }
 
-func (g *GoBGP) WatchRIB(h BGPHandler) error {
-	table := &api.Table{
-		Type:   api.Resource_GLOBAL,
-		Family: uint32(bgp.RF_EVPN),
-	}
-	resp, err := g.client.GetRib(context.Background(), &api.GetRibRequest{Table: table})
+func (g *GoBGP) GetRIB(h BGPHandler) error {
+	resp, err := g.client.GetRib(context.Background(), &api.GetRibRequest{Table: evpnTable})
 	if err != nil {
 		return err
 	}
@@ -185,8 +186,15 @@ func (g *GoBGP) WatchRIB(h BGPHandler) error {
 			return err
 		}
 	}
+	return nil
+}
 
-	stream, err := g.client.MonitorRib(context.Background(), table)
+func (g *GoBGP) WatchRIB(h BGPHandler) error {
+	if err := g.GetRIB(h); err != nil {
+		return err
+	}
+
+	stream, err := g.client.MonitorRib(context.Background(), evpnTable)
 	if err != nil {
 		return err
 	}

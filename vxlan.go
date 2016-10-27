@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
@@ -25,7 +26,7 @@ type vxlanHandler struct {
 	w           *gof.Writer
 	pm          vxlanPortMap
 	vteps       map[uint32]map[uint32]net.IP
-	gateways    map[uint32]*Gateway
+	gateways    atomic.Value
 	pb          packetBuffer
 	vxlanPort   uint32
 	suppressARP bool
@@ -37,7 +38,7 @@ type vxlanHandler struct {
 func (h *vxlanHandler) Features(w *gof.Writer, d ofp4.SwitchFeatures) {
 	h.w = w
 	write(w, &gof.MultipartRequest{Type: ofp4.OFPMP_PORT_DESC})
-	if h.gateways == nil {
+	if h.getGateways() == nil {
 		return
 	}
 	write(w, &gof.FlowMod{
@@ -93,13 +94,16 @@ func (h *vxlanHandler) MultipartReply(w *gof.Writer, d ofp4.MultipartReply) {
 			}
 		})
 	})
+	h.setGatewayARP()
+}
 
-	for vni, gw := range h.gateways {
+func (h *vxlanHandler) setGatewayARP() {
+	for vni, gw := range h.getGateways() {
 		desc := h.pm.FindByVNI(vni)
 		if desc == nil {
 			continue
 		}
-		write(w, arpReplyFlow(1, desc.Port, gwMAC, gw.Address))
+		write(h.w, arpReplyFlow(1, desc.Port, gwMAC, gw.Address))
 	}
 }
 
@@ -126,7 +130,8 @@ func (h *vxlanHandler) PacketIn(w *gof.Writer, d ofp4.PacketIn) {
 	if desc == nil {
 		return
 	}
-	gw, ok := h.gateways[desc.VNI]
+	gateways := h.getGateways()
+	gw, ok := gateways[desc.VNI]
 	if !ok || len(gw.ConnectedTo) == 0 {
 		return
 	}
@@ -139,7 +144,7 @@ func (h *vxlanHandler) PacketIn(w *gof.Writer, d ofp4.PacketIn) {
 
 	discard = false
 	for _, vni := range gw.ConnectedTo {
-		arp, err := makeARPRequest(h.gateways[vni].Address, ip.DstIP)
+		arp, err := makeARPRequest(gateways[vni].Address, ip.DstIP)
 		if err != nil {
 			log.Print("Failed to make arp request: %v", err)
 			continue
@@ -229,7 +234,10 @@ func (h *vxlanHandler) AddMacIPRoute(etag uint32, mac net.HardwareAddr, ip net.I
 	}
 	isLocal := isLocalHop(nexthop)
 	desc := h.pm.FindByVNI(etag)
-	if !isLocal && desc != nil {
+	if desc == nil {
+		return
+	}
+	if !isLocal {
 		write(h.w, &gof.FlowMod{
 			Priority: 10,
 			Matches:  gof.Matches(gof.InPort(desc.Port), gof.EthDst(mac)),
@@ -247,30 +255,38 @@ func (h *vxlanHandler) AddMacIPRoute(etag uint32, mac net.HardwareAddr, ip net.I
 	if !isLocal && h.suppressARP {
 		write(h.w, arpReplyFlow(0, desc.Port, mac, ip))
 	}
-	if gw, ok := h.gateways[etag]; ok {
-		actions := gof.Actions(gof.SetField(gof.EthDst(mac)), gof.SetField(gof.EthSrc(gwMAC)))
-		if isLocal {
-			actions = append(actions, gof.Output(desc.Port))
-		} else {
-			actions = append(actions,
-				gof.SetField(gof.TunnelID(uint64(etag))),
-				gof.SetField(nxm.TunnelIPv4Dst(nexthop)),
-				gof.Output(h.vxlanPort),
-			)
+	if gw, ok := h.getGateways()[etag]; ok {
+		h.addRoute(gw, etag, mac, ip, nexthop)
+	}
+}
+
+func (h *vxlanHandler) addRoute(gw *Gateway, vni uint32, mac net.HardwareAddr, ip net.IP, via net.IP) {
+	actions := gof.Actions(gof.SetField(gof.EthDst(mac)), gof.SetField(gof.EthSrc(gwMAC)))
+	if isLocalHop(via) {
+		desc := h.pm.FindByVNI(vni)
+		if desc == nil {
+			return
 		}
-		for _, vni := range gw.ConnectedTo {
-			d := h.pm.FindByVNI(vni)
-			if d == nil {
-				continue
-			}
-			write(h.w, &gof.FlowMod{
-				TableID:      1,
-				Priority:     10,
-				Matches:      gof.Matches(gof.InPort(d.Port), gof.EthType(gof.EthTypeIP), gof.IPv4Dst(ip)),
-				Instructions: gof.Instructions(gof.ApplyActions(actions...)),
-			})
-			h.pb.Flush(d.Port, ip, h.w, actions)
+		actions = append(actions, gof.Output(desc.Port))
+	} else {
+		actions = append(actions,
+			gof.SetField(gof.TunnelID(uint64(vni))),
+			gof.SetField(nxm.TunnelIPv4Dst(via)),
+			gof.Output(h.vxlanPort),
+		)
+	}
+	for _, vni := range gw.ConnectedTo {
+		d := h.pm.FindByVNI(vni)
+		if d == nil {
+			continue
 		}
+		write(h.w, &gof.FlowMod{
+			TableID:      1,
+			Priority:     10,
+			Matches:      gof.Matches(gof.InPort(d.Port), gof.EthType(gof.EthTypeIP), gof.IPv4Dst(ip)),
+			Instructions: gof.Instructions(gof.ApplyActions(actions...)),
+		})
+		h.pb.Flush(d.Port, ip, h.w, actions)
 	}
 }
 
@@ -288,15 +304,32 @@ func (h *vxlanHandler) DeleteMacIPRoute(etag uint32, mac net.HardwareAddr, ip ne
 	if !isLocal && h.suppressARP {
 		write(h.w, deleteFlow(0, gof.InPort(desc.Port), gof.EthType(gof.EthTypeARP), gof.ARPTpa(ip)))
 	}
-	if gw, ok := h.gateways[etag]; ok {
-		for _, vni := range gw.ConnectedTo {
-			d := h.pm.FindByVNI(vni)
-			if d == nil {
-				continue
-			}
-			write(h.w, deleteFlow(1, gof.InPort(d.Port), gof.EthType(gof.EthTypeIP), gof.IPv4Dst(ip)))
-		}
+	if gw, ok := h.getGateways()[etag]; ok {
+		h.deleteRoute(gw, ip)
 	}
+}
+
+func (h *vxlanHandler) deleteRoute(gw *Gateway, ip net.IP) {
+	for _, vni := range gw.ConnectedTo {
+		d := h.pm.FindByVNI(vni)
+		if d == nil {
+			continue
+		}
+		write(h.w, deleteFlow(1, gof.InPort(d.Port), gof.EthType(gof.EthTypeIP), gof.IPv4Dst(ip)))
+	}
+}
+
+func (h *vxlanHandler) getGateways() map[uint32]*Gateway {
+	if v := h.gateways.Load(); v != nil {
+		return v.(map[uint32]*Gateway)
+	}
+	return nil
+}
+
+func (h *vxlanHandler) updateGateways(gateways map[uint32]*Gateway) {
+	h.gateways.Store(gateways)
+	h.setGatewayARP()
+	h.bgp.GetRIB(h)
 }
 
 func deleteFlow(table uint8, ms ...gof.MatchMarshaler) *gof.FlowMod {
