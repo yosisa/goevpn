@@ -15,7 +15,10 @@ import (
 	"github.com/yosisa/gof/nxm"
 )
 
-var gwMAC = net.HardwareAddr{0xfe, 0xed, 0xde, 0xad, 0xbe, 0xef}
+var (
+	gwMAC        = net.HardwareAddr{0xfe, 0xed, 0xde, 0xad, 0xbe, 0xef}
+	broadcastMAC = net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+)
 
 type vxlanHandler struct {
 	gof.NopFancyHandler
@@ -40,6 +43,11 @@ func (h *vxlanHandler) Features(w *gof.Writer, d ofp4.SwitchFeatures) {
 	write(w, &gof.FlowMod{
 		Priority:     100,
 		Matches:      gof.Matches(gof.EthDst(gwMAC)),
+		Instructions: gof.Instructions(gof.GotoTable(1)),
+	})
+	write(w, &gof.FlowMod{
+		Priority:     100,
+		Matches:      gof.Matches(gof.EthType(gof.EthTypeARP), gof.ARPOp(gof.ARPOpRequest), gof.EthDst(broadcastMAC)),
 		Instructions: gof.Instructions(gof.GotoTable(1)),
 	})
 	write(w, &gof.FlowMod{
