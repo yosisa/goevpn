@@ -72,27 +72,7 @@ func (h *vxlanHandler) MultipartReply(w *gof.Writer, d ofp4.MultipartReply) {
 		resetOnce.Do(func() {
 			h.pm.Reset()
 		})
-		name := gof.PortName(p.Name())
-		port := p.PortNo()
-		if strings.Contains(name, "vxlan") {
-			h.vxlanPort = port
-			write(w, &gof.FlowMod{
-				Priority: 1000,
-				Matches:  gof.Matches(gof.InPort(port), gof.EthDst(gwMAC)),
-			})
-			return
-		}
-		n, err := strconv.ParseUint(name[1:len(name)-1], 10, 32)
-		if err != nil {
-			return
-		}
-		h.pm.Add(&vxlanPortDesc{Port: port, VNI: uint32(n)})
-
-		write(w, &gof.FlowMod{
-			Priority:     100,
-			Matches:      gof.Matches(gof.TunnelID(n)),
-			Instructions: gof.Instructions(gof.ApplyActions(gof.Output(port))),
-		})
+		h.addPort(p)
 	})
 
 	h.watchOnce.Do(func() {
@@ -106,6 +86,30 @@ func (h *vxlanHandler) MultipartReply(w *gof.Writer, d ofp4.MultipartReply) {
 	h.setGatewayARP()
 }
 
+func (h *vxlanHandler) addPort(p ofp4.Port) {
+	name := gof.PortName(p.Name())
+	port := p.PortNo()
+	if strings.Contains(name, "vxlan") {
+		h.vxlanPort = port
+		write(h.w, &gof.FlowMod{
+			Priority: 1000,
+			Matches:  gof.Matches(gof.InPort(port), gof.EthDst(gwMAC)),
+		})
+		return
+	}
+	n, err := strconv.ParseUint(name[1:len(name)-1], 10, 32)
+	if err != nil {
+		return
+	}
+	h.pm.Add(&vxlanPortDesc{Port: port, VNI: uint32(n)})
+
+	write(h.w, &gof.FlowMod{
+		Priority:     100,
+		Matches:      gof.Matches(gof.TunnelID(n)),
+		Instructions: gof.Instructions(gof.ApplyActions(gof.Output(port))),
+	})
+}
+
 func (h *vxlanHandler) setGatewayARP() {
 	for vni, gw := range h.getGateways() {
 		desc := h.pm.FindByVNI(vni)
@@ -113,6 +117,16 @@ func (h *vxlanHandler) setGatewayARP() {
 			continue
 		}
 		write(h.w, arpReplyFlow(1, desc.Port, gwMAC, gw.Address))
+	}
+}
+
+func (h *vxlanHandler) PortStatus(w *gof.Writer, d ofp4.PortStatus) {
+	p := ofp4.Port(d[16:])
+	log.Printf("Received PortStatus of %s", gof.PortName(p.Name()))
+	switch d.Reason() {
+	case ofp4.OFPPR_ADD:
+		h.addPort(p)
+		h.setGatewayARP()
 	}
 }
 
