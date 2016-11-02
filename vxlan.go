@@ -42,14 +42,23 @@ func (h *vxlanHandler) Features(w *gof.Writer, d ofp4.SwitchFeatures) {
 		return
 	}
 	write(w, &gof.FlowMod{
-		Priority:     100,
+		Priority:     50,
 		Matches:      gof.Matches(gof.EthDst(gwMAC)),
 		Instructions: gof.Instructions(gof.GotoTable(1)),
 	})
 	write(w, &gof.FlowMod{
-		Priority:     100,
+		Priority:     50,
 		Matches:      gof.Matches(gof.EthType(gof.EthTypeARP), gof.ARPOp(gof.ARPOpRequest), gof.EthDst(broadcastMAC)),
 		Instructions: gof.Instructions(gof.GotoTable(1)),
+	})
+	write(w, &gof.FlowMod{
+		Instructions: gof.Instructions(gof.GotoTable(2)),
+	})
+	write(w, &gof.FlowMod{
+		TableID:      1,
+		Priority:     5,
+		Matches:      gof.Matches(gof.EthDst(broadcastMAC)),
+		Instructions: gof.Instructions(gof.GotoTable(2)),
 	})
 	write(w, &gof.FlowMod{
 		TableID:      1,
@@ -68,7 +77,7 @@ func (h *vxlanHandler) MultipartReply(w *gof.Writer, d ofp4.MultipartReply) {
 		if strings.Contains(name, "vxlan") {
 			h.vxlanPort = port
 			write(w, &gof.FlowMod{
-				Priority: 110,
+				Priority: 1000,
 				Matches:  gof.Matches(gof.InPort(port), gof.EthDst(gwMAC)),
 			})
 			return
@@ -80,7 +89,7 @@ func (h *vxlanHandler) MultipartReply(w *gof.Writer, d ofp4.MultipartReply) {
 		h.pm.Add(&vxlanPortDesc{Port: port, VNI: uint32(n)})
 
 		write(w, &gof.FlowMod{
-			Priority:     10,
+			Priority:     100,
 			Matches:      gof.Matches(gof.TunnelID(n)),
 			Instructions: gof.Instructions(gof.ApplyActions(gof.Output(port))),
 		})
@@ -219,7 +228,8 @@ func (h *vxlanHandler) updateBUM() {
 			actions = append(actions, gof.SetField(nxm.TunnelIPv4Dst(ip)), gof.Output(h.vxlanPort))
 		}
 		write(h.w, &gof.FlowMod{
-			Priority:     5,
+			TableID:      2,
+			Priority:     10,
 			Matches:      gof.Matches(gof.InPort(p.Port)),
 			Instructions: gof.Instructions(gof.ApplyActions(actions...)),
 		})
@@ -253,7 +263,7 @@ func (h *vxlanHandler) AddMacIPRoute(etag uint32, mac net.HardwareAddr, ip net.I
 	}
 
 	if !isLocal && h.suppressARP {
-		write(h.w, arpReplyFlow(0, desc.Port, mac, ip))
+		write(h.w, arpReplyFlow(1, desc.Port, mac, ip))
 	}
 	if gw, ok := h.getGateways()[etag]; ok {
 		h.addRoute(gw, etag, mac, ip, nexthop)
@@ -345,7 +355,7 @@ func deleteFlow(table uint8, ms ...gof.MatchMarshaler) *gof.FlowMod {
 func arpReplyFlow(table uint8, port uint32, mac net.HardwareAddr, ip net.IP) *gof.FlowMod {
 	return &gof.FlowMod{
 		TableID:  table,
-		Priority: 15,
+		Priority: 10,
 		Matches: gof.Matches(
 			gof.InPort(port),
 			gof.EthType(gof.EthTypeARP),
